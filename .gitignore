@@ -1,0 +1,22 @@
+# Secrets / credentials
+credentials.json
+token.json
+.claude/settings.local.json
+
+# Excel source data
+*.xlsx
+downloads/
+archive/
+
+# Generated / regenerable output
+*.log
+*.pdf
+report_Jun_2026.html
+GL_Dashboard_v4_July2026.backup_*.html
+processed_ids.json
+pdf_out.txt
+pdf_err.txt
+
+# Python
+__pycache__/
+*.pyc

@@ -1,0 +1,34 @@
+Mon 7 Jul — Day 27
+
+Project Area: Data Integrity — Water & Facility Metrics
+Tasks Undertaken: Investigated a live bug where genuine zero-value meter readings were being conflated with missing data (Canteen Flow tab showing "0 days with data" despite 5 real zero-consumption readings existing in the source Excel); traced the fault through the parser, injector, and dashboard render layers
+Deliverables / Outputs: Fixed null-vs-zero handling in excel_parser.py (missing days now emit null instead of defaulting to 0), dashboard_injector.py's fmt() (explicit null passthrough), and the dashboard's renderROCanteen() (switched all "has data" checks from v>0 to v!=null); verified via Playwright screenshot showing correct "5 days with data" and populated chart
+Blockers / Issues: Same v>0 pattern likely exists in other untouched metrics (New Well, Laundromat, Sathiya, AC Outlet, TDS, STP Flow, RO Cans) — scoped as a separate follow-up audit, not yet started
+
+Tue 8 Jul — Day 28
+
+Project Area: Energy Section — Solar Reporting
+Tasks Undertaken: Identified that Main Solar zones had monthly totals but no daily-level breakdown or zone-level detail, unlike RM Solar which had both; extended excel_parser.py and dashboard_injector.py to inject daily Main Solar data (PGDM Hostel, New Academic, RHS) that was already being parsed but never surfaced
+Deliverables / Outputs: Added "Daily Main Avg" KPI card, a full "Main Solar Zones — Daily Average" zone-card grid, and a Main Solar daily stacked bar chart — mirroring the existing RM Solar UI exactly; verified live with real July data (442 kWh daily average) and zero JS errors
+Blockers / Issues: None
+
+Wed 9 Jul — Day 29
+
+Project Area: Facility Section — Dashboard Redesign
+Tasks Undertaken: Reworked the Facility Overview tab after feedback that two KPI cards (AC Works, Plumbing Works) were confusing and unexplained; split Street Light data out of the AMC tab into its own dedicated, fully-detailed tab; added AMC status, Manpower-by-department, and Chair Capacity summary charts to Overview so it genuinely reflects every sub-tab
+Deliverables / Outputs: New "Street Lights" tab (KPIs, full status chart, failure-only chart, inventory table); Overview now shows 5 charts spanning Operations, Street Lights, AMC, Manpower, and Chair Count; fixed a pre-existing Chart.js bug where all doughnut charts rendered with stray numeric axes
+Blockers / Issues: None
+
+Thu 10 Jul — Day 30
+
+Project Area: Pipeline Resilience — Schema Drift Detection
+Tasks Undertaken: Addressed the question of whether the pipeline auto-adapts to Excel sheet renames or new sheets — confirmed it does not, and that unmatched sheets were previously failing silently with no signal; designed and built a detector that compares every sheet in an incoming workbook against every sheet name any parser has ever looked for
+Deliverables / Outputs: detect_unmatched_sheets() added to excel_parser.py; wired into run_pipeline.py's existing freshness-check alert email (no new email type introduced); live-tested against the real current WTP Excel — correctly flagged 10 unrecognized sheets, one of which (a "RO water reading" sheet) was traced and confirmed to be stale 2012 legacy data, not a real gap
+Blockers / Issues: None
+
+Fri 11 Jul — Day 31
+
+Project Area: Documentation & Handover
+Tasks Undertaken: Produced two reference PDFs — a Day 1 Implementation Plan and a Day 1 Execution Record — reconstructed from pipeline.log/fetcher.log timestamps to document the project's original build plan versus what was actually shipped, including deviations and gaps
+Deliverables / Outputs: Day1_Implementation_Plan.pdf and Day1_Execution_Record.pdf generated via ReportLab, covering architecture, dependencies, planned vs. actual timeline, and known gaps left open after Day 1
+Blockers / Issues: None
