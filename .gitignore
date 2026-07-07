@@ -1,7 +1,9 @@
+# Claude Code config
+.claude/
+
 # Secrets / credentials
 credentials.json
 token.json
-.claude/settings.local.json
 
 # Dashboard output (contains real institutional data)
 GL_Dashboard_v4_July2026.html
