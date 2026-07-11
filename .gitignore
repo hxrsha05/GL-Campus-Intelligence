@@ -8,6 +8,10 @@ token.json
 # Dashboard output (contains real institutional data)
 GL_Dashboard_v4_July2026.html
 
+# Vercel deploy staging (copy of the real dashboard + Vercel's own local state)
+vercel_deploy/index.html
+vercel_deploy/.vercel/
+
 # Excel source data
 *.xlsx
 downloads/
@@ -21,6 +25,9 @@ GL_Dashboard_v4_July2026.backup_*.html
 processed_ids.json
 pdf_out.txt
 pdf_err.txt
+ALERT_UNDELIVERED.txt
+LAST_REPORT_SENT.txt
+LAST_NOTICE_SENT.txt
 
 # Python
 __pycache__/

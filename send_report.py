@@ -33,7 +33,6 @@ from reportlab.platypus import Flowable
 
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 
 BASE_DIR         = Path(__file__).parent
@@ -168,15 +167,26 @@ def extract_buildings(html):
     return buildings
 
 
-def extract_wo_dept(html, dept):
-    m = re.search(rf'{dept}:\s*\[([^\]]*)\]', html)
-    if not m: return []
-    return [int(v) for v in m.group(1).split(',') if v.strip().isdigit()]
+def extract_labels_vals(html, var_name):
+    """Extract a `const NAME = {labels:[...], vals:[...]};` shaped object."""
+    m = re.search(rf'const\s+{re.escape(var_name)}\s*=\s*\{{labels:\[([^\]]*)\],vals:\[([^\]]*)\]\}}', html)
+    if not m:
+        return {'labels': [], 'vals': []}
+    labels = [t.strip().strip("'") for t in m.group(1).split(',') if t.strip()]
+    vals = [float(t) for t in m.group(2).split(',') if t.strip()]
+    return {'labels': labels, 'vals': vals}
+
+
+def extract_js_scalar(html, var_name):
+    m = re.search(rf'const\s+{re.escape(var_name)}\s*=\s*(-?\d+(?:\.\d+)?|null);', html)
+    if not m or m.group(1) == 'null':
+        return None
+    return float(m.group(1))
 
 
 def load_dashboard_data():
     html = DASHBOARD_FILE.read_text(encoding='utf-8')
-    days_m = re.search(r"const JUN_DAYS\s*=\s*\[([^\]]+)\]", html)
+    days_m = re.search(r"const CUR_DAYS\s*=\s*\[([^\]]+)\]", html)
     day_labels = []
     if days_m:
         day_labels = [d.strip().strip("'") for d in days_m.group(1).split(',')]
@@ -187,10 +197,10 @@ def load_dashboard_data():
     return {
         'html': html, 'month': month_label,
         'day_labels': day_labels, 'n_days': len(day_labels),
-        'eb': extract_js_array(html, 'junEB'),
-        'dg': extract_js_array(html, 'junDG'),
-        'diesel': extract_js_array(html, 'junDiesel'),
-        'stock': extract_js_array(html, 'junStock'),
+        'eb': extract_js_array(html, 'curEB'),
+        'dg': extract_js_array(html, 'curDG'),
+        'diesel': extract_js_array(html, 'curDiesel'),
+        'stock': extract_js_array(html, 'curStock'),
         'power_cuts': extract_power_cuts(html),
         'ev': extract_js_array(html, 'evDailyKWh'),
         'nescafe': extract_js_array(html, 'nescafeDailyKWh'),
@@ -206,6 +216,11 @@ def load_dashboard_data():
         'ro_cans': extract_js_array(html, 'roCansDaily'),
         'tds_ro2000': extract_js_array(html, 'tdsRo2000'),
         'buildings': extract_buildings(html),
+        'tickets_by_dept': extract_labels_vals(html, 'ticketsByDept'),
+        'ticket_total': extract_js_scalar(html, 'ticketTotal'),
+        'ticket_pending': extract_js_scalar(html, 'ticketPending'),
+        'ticket_avg_tat_min': extract_js_scalar(html, 'ticketAvgTatMin'),
+        'ticket_recurring_by_dept': extract_labels_vals(html, 'ticketRecurringByDept'),
     }
 
 
@@ -214,6 +229,9 @@ def load_dashboard_data():
 def s(arr):   return sum(v for v in (arr or []) if v)
 def nz(arr):  return [v for v in (arr or []) if v and v > 0]
 def avg(arr): vals = nz(arr); return sum(vals)/len(vals) if vals else 0
+def fmt_min_hm(minutes):
+    m = int(round(minutes))
+    return f"{m // 60}h {m % 60}m"
 def peak_day(arr, labels):
     pairs = [(v, labels[i]) for i, v in enumerate(arr or []) if v and i < len(labels)]
     return max(pairs, key=lambda x: x[0]) if pairs else (0, 'N/A')
@@ -267,10 +285,15 @@ def compute_insights(d):
     tea_t = s(d['tea']); yum_t = s(d['yummy']); le_t  = s(d['laundry_e'])
     tenant_total = ev_t + nesc_t + cvb_t + tea_t + yum_t + le_t
 
-    wo_e = extract_wo_dept(html,'electrical'); wo_s = extract_wo_dept(html,'stp')
-    wo_p = extract_wo_dept(html,'plumbing');   wo_a = extract_wo_dept(html,'ac')
-    wo_c = extract_wo_dept(html,'carpentry')
-    wo_total = int(s(wo_e)+s(wo_s)+s(wo_p)+s(wo_a)+s(wo_c))
+    # ── Digii Tickets (all-time cumulative, not month-scoped like everything
+    # else — the source file is always the full history) ──
+    tickets_by_dept = d['tickets_by_dept']
+    ticket_total = int(d['ticket_total'] or 0)
+    ticket_pending = int(d['ticket_pending'] or 0)
+    ticket_avg_tat_min = d['ticket_avg_tat_min']
+    recurring_by_dept = d['ticket_recurring_by_dept']
+    ticket_recurring_total = int(sum(recurring_by_dept['vals'])) if recurring_by_dept['vals'] else 0
+    has_ticket_data = ticket_total > 0
 
     # ── Building sub-meter panels ──
     BUILDING_LABELS = {
@@ -404,20 +427,27 @@ def compute_insights(d):
                 f"(3-day buffer) to avoid shortages during peak demand days."
             )
 
-    # 5. Work orders (only when the source Excel actually had work-order sheets for this month)
-    has_wo_data = bool(wo_e or wo_s or wo_p or wo_a or wo_c)
-    if has_wo_data:
-        wo_counts = {'Electrical': int(s(wo_e)), 'STP': int(s(wo_s)),
-                     'Plumbing': int(s(wo_p)), 'AC': int(s(wo_a)), 'Carpentry': int(s(wo_c))}
-        top_dept, top_count = max(wo_counts.items(), key=lambda x: x[1])
-        if top_count > 10:
+    # 5. Digii Tickets (all-time cumulative — insight reflects the whole
+    # history to date, not just this reporting month)
+    if has_ticket_data:
+        if tickets_by_dept['labels']:
+            top_dept = tickets_by_dept['labels'][0]
+            top_count = int(tickets_by_dept['vals'][0])
             outlook.append(
-                f"{top_dept} had the most work orders this month ({top_count}) — conduct a root-cause review and "
-                f"schedule preventive maintenance to reduce reactive calls in {next_month_name}."
+                f"{top_dept} has raised the most Digii tickets to date ({top_count:,}) — conduct a root-cause "
+                f"review and schedule preventive maintenance to reduce reactive calls."
             )
-        else:
+        if ticket_recurring_total > 0 and recurring_by_dept['labels']:
+            top_recur_dept = recurring_by_dept['labels'][0]
+            top_recur_count = int(recurring_by_dept['vals'][0])
             outlook.append(
-                f"Work order volume was manageable ({wo_total} total) — review open/pending items and close before {next_month_name} starts."
+                f"{ticket_recurring_total} tickets were re-raised by the same person for the same problem within "
+                f"3 days of being marked resolved — {top_recur_dept} accounts for the most ({top_recur_count}). "
+                f"Fixes here may not be holding; recommend a follow-up inspection pass."
+            )
+        if ticket_pending > 0:
+            outlook.append(
+                f"{ticket_pending} Digii ticket(s) remain pending — follow up before {next_month_name} to keep the backlog from growing."
             )
 
     # 6. Water / well
@@ -467,9 +497,10 @@ def compute_insights(d):
         tds_avg=tds_avg, tds_min=tds_min, tds_max=tds_max,
         ev_t=ev_t, nesc_t=nesc_t, cvb_t=cvb_t,
         tea_t=tea_t, yum_t=yum_t, le_t=le_t, tenant_total=tenant_total,
-        wo_total=wo_total, wo_e=int(s(wo_e)), wo_s=int(s(wo_s)),
-        wo_p=int(s(wo_p)), wo_a=int(s(wo_a)), wo_c=int(s(wo_c)),
-        has_wo_data=bool(wo_e or wo_s or wo_p or wo_a or wo_c),
+        ticket_total=ticket_total, ticket_pending=ticket_pending,
+        ticket_avg_tat_min=ticket_avg_tat_min, tickets_by_dept=tickets_by_dept,
+        ticket_recurring_total=ticket_recurring_total, recurring_by_dept=recurring_by_dept,
+        has_ticket_data=has_ticket_data,
         eb_avg_day=eb_avg_day, eb_trending=eb_trending,
         building_rows=building_rows, buildings_total=buildings_total,
         flags=flags, outlook=outlook,
@@ -754,8 +785,8 @@ def build_pdf(ins: dict) -> bytes:
         ('DG Units',      f"{ins['dg_total']:,.0f}", 'kWh',     '#EA580C'),
         ('Water Produced',f"{ins['wtp_total']:,.0f}",'KL',      '#0891B2'),
     ]
-    if ins.get('has_wo_data'):
-        kpi_items.append(('Work Orders', f"{ins['wo_total']:,}", 'closed', '#059669'))
+    if ins.get('has_ticket_data'):
+        kpi_items.append(('Digii Tickets', f"{ins['ticket_total']:,}", 'all-time', '#059669'))
     kpi_items.append(('Power Outages', f"{ins['cut_count']}", f"{ins['cut_min']} min total", '#DC2626'))
     story.append(KPIRow(kpi_items, W, PAD))
     story.append(Spacer(1, 12))
@@ -912,41 +943,40 @@ def build_pdf(ins: dict) -> bytes:
         tail.append(Paragraph("Supplementary building panel sub-meters — not included in campus EB/DG totals above.", S['small']))
         tail.append(Spacer(1, 8))
 
-    # Work Orders (only when the source Excel actually had work-order sheets for this month)
-    if ins.get('has_wo_data'):
+    # Digii Tickets (all-time cumulative — the source file is always the
+    # full history, so this table reflects everything to date, not just
+    # this reporting month)
+    if ins.get('has_ticket_data'):
         tail.append(HRFlowable(width=TW, thickness=0.5, color=BORDER))
-        tail.append(Paragraph("Work Orders", S['sec']))
+        tail.append(Paragraph("Digii Tickets", S['sec']))
 
-        wo_items = [
-            ('Electrical', ins['wo_e'], '#1B4FD8'),
-            ('STP',        ins['wo_s'], '#0891B2'),
-            ('Plumbing',   ins['wo_p'], '#059669'),
-            ('AC',         ins['wo_a'], '#D97706'),
-            ('Carpentry',  ins['wo_c'], '#7C3AED'),
-        ]
-        wo_total_check = sum(v for _, v, _ in wo_items)
-        wo_data = [
-            [Paragraph('Department', S['th']), Paragraph('Orders', S['th']),
+        DEPT_COLORS = ['#1B4FD8', '#0891B2', '#059669', '#D97706', '#7C3AED', '#CA8A04', '#DB2777', '#DC2626']
+        tk_dept = ins['tickets_by_dept']
+        tk_items = list(zip(tk_dept['labels'], tk_dept['vals']))
+        tk_total_check = sum(v for _, v in tk_items) or 1
+        tk_data = [
+            [Paragraph('Problem Type', S['th']), Paragraph('Tickets', S['th']),
              Paragraph('Share', S['th']), Paragraph('Trend Bar', S['th'])],
         ]
-        for name, val, color in wo_items:
-            pct = val / wo_total_check * 100 if wo_total_check else 0
+        for i, (name, val) in enumerate(tk_items):
+            pct = val / tk_total_check * 100
             bar = '█' * int(pct / 3)
-            wo_data.append([
+            color = DEPT_COLORS[i % len(DEPT_COLORS)]
+            tk_data.append([
                 Paragraph(name, S['td']),
-                Paragraph(f"{val:,}", S['num']),
+                Paragraph(f"{int(val):,}", S['num']),
                 Paragraph(f"{pct:.1f}%", S['tdc']),
                 Paragraph(f'<font color="{color}">{bar}</font>', S['td']),
             ])
-        wo_data.append([
+        tk_data.append([
             Paragraph('<b>Total</b>', S['bold']),
-            Paragraph(f"<b>{ins['wo_total']:,}</b>", style('wo_tot', fontName='Helvetica-Bold',
+            Paragraph(f"<b>{ins['ticket_total']:,}</b>", style('tk_tot', fontName='Helvetica-Bold',
                       fontSize=8.5, textColor=INK, leading=12, alignment=TA_RIGHT)),
             Paragraph('100%', S['tdc']),
             Paragraph('', S['td']),
         ])
-        wo_tbl = Table(wo_data, colWidths=[TW*0.28, TW*0.18, TW*0.16, TW*0.38])
-        wo_tbl.setStyle(TableStyle([
+        tk_tbl = Table(tk_data, colWidths=[TW*0.28, TW*0.18, TW*0.16, TW*0.38])
+        tk_tbl.setStyle(TableStyle([
             ('BACKGROUND',    (0,0), (-1,0),  HexColor('#F3F4F6')),
             ('BACKGROUND',    (0,-1),(-1,-1), HexColor('#F0FDF4')),
             ('ROWBACKGROUNDS',(0,1), (-1,-2), [white, HexColor('#FAFAFA')]),
@@ -957,7 +987,14 @@ def build_pdf(ins: dict) -> bytes:
             ('RIGHTPADDING',  (0,0), (-1,-1), 8),
             ('VALIGN',        (0,0), (-1,-1), 'MIDDLE'),
         ]))
-        tail.append(wo_tbl)
+        tail.append(tk_tbl)
+        tat_str = fmt_min_hm(ins['ticket_avg_tat_min']) if ins['ticket_avg_tat_min'] is not None else 'N/A'
+        tail.append(Paragraph(
+            f"{ins['ticket_pending']} pending · avg resolution time {tat_str} · "
+            f"{ins['ticket_recurring_total']} recurring issue(s) flagged (same person, same problem, "
+            f"resolved and reopened within 3 days)",
+            S['small']
+        ))
         tail.append(Spacer(1, 8))
 
     # Insights
@@ -996,15 +1033,33 @@ def build_pdf(ins: dict) -> bytes:
 # ── Gmail ──────────────────────────────────────────────────────────────────────
 
 def get_gmail_service():
+    """
+    Same token.json as gmail_fetcher.authenticate() — never opens a browser
+    on an unattended run. If the stored token can't be silently refreshed,
+    raise gmail_fetcher.AuthNeedsHumanError immediately rather than blocking
+    on run_local_server() forever, since this function is also on the path
+    that sends crash/freshness alert emails: a hang here would silently
+    swallow the one notification meant to tell a human the token died.
+    """
+    from gmail_fetcher import AuthNeedsHumanError
+
     creds = None
     if TOKEN_FILE.exists():
-        creds = Credentials.from_authorized_user_file(str(TOKEN_FILE), SCOPES)
+        try:
+            creds = Credentials.from_authorized_user_file(str(TOKEN_FILE), SCOPES)
+        except ValueError as e:
+            log.warning("token.json is unreadable/incomplete (%s) — treating as missing", e)
+            creds = None
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
         else:
-            flow = InstalledAppFlow.from_client_secrets_file(str(CREDENTIALS_FILE), SCOPES)
-            creds = flow.run_local_server(port=0)
+            raise AuthNeedsHumanError(
+                "Gmail OAuth needs a human to re-authorize: token.json is missing, "
+                "invalid, or has no usable refresh_token. Run gmail_fetcher.py's "
+                "bootstrap_token() interactively on a machine with a browser, then "
+                "redeploy the resulting token.json to this host."
+            )
         TOKEN_FILE.write_text(creds.to_json())
     return build('gmail', 'v1', credentials=creds)
 

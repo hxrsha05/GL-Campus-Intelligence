@@ -11,6 +11,7 @@ report is built from — there is no "look back" once that happens.
 
 import json
 import logging
+import os
 import re
 from pathlib import Path
 from datetime import datetime
@@ -30,7 +31,7 @@ log = logging.getLogger(__name__)
 
 def _read_dashboard_month_year(html: str) -> tuple[int, int] | None:
     """Read the month/year the dashboard is CURRENTLY showing, before this run's injection."""
-    days_m = re.search(r"const JUN_DAYS\s*=\s*\[\s*'?\d+-([A-Za-z]{3})'", html)
+    days_m = re.search(r"const CUR_DAYS\s*=\s*\[\s*'?\d+-([A-Za-z]{3})'", html)
     yr_m   = re.search(r"const\s+CUR_YEAR\s*=\s*(\d+);", html)
     if not days_m or not yr_m:
         return None
@@ -51,7 +52,12 @@ def _load_index() -> list:
 
 def _save_index(entries: list) -> None:
     ARCHIVE_DIR.mkdir(exist_ok=True)
-    INDEX_FILE.write_text(json.dumps(entries, indent=2), encoding="utf-8")
+    # Atomic write — a corrupted index would make check_and_rollover() unable
+    # to tell what's already archived, risking either a duplicate archive or
+    # a skipped one on the next run.
+    tmp = INDEX_FILE.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(entries, indent=2), encoding="utf-8")
+    os.replace(str(tmp), str(INDEX_FILE))
 
 
 def archive_current_report(month_num: int, year: int) -> dict | None:

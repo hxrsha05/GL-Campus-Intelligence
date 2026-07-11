@@ -31,6 +31,8 @@ SCOPES           = ["https://www.googleapis.com/auth/gmail.modify"]
 # from a different address — add it here if the sender changes.
 SENDER_FILTERS = [
     "sodexo@greatlakes.edu.in",
+    "kalaimughilan@greatlakes.edu.in",  # Digii Tickets (service request export)
+    "itsupport@greatlakes.edu.in",      # Digii Tickets — also sent from IT Support's shared inbox
     # WTP report sender — add if they email from a distinct address:
     # "wtp@greatlakes.edu.in",
 ]
@@ -48,28 +50,72 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
+class AuthNeedsHumanError(RuntimeError):
+    """
+    Raised when the stored token can't be silently refreshed and completing
+    auth would require a human to click through a browser consent screen.
+    On an unattended host there is nobody to do that — callers should treat
+    this as distinct from a generic failure (e.g. skip retrying the same way
+    an API hiccup would be retried, and word the alert email accordingly).
+    """
+
+
 def authenticate() -> object:
-    """OAuth flow — opens browser on first run, reuses token.json after."""
+    """
+    OAuth flow — reuses token.json's refresh token silently when possible.
+    Never opens a browser without a bound timeout: on a headless/unattended
+    host there is no one to complete an interactive consent screen, and the
+    underlying run_local_server() call has no timeout of its own (blocks
+    forever by default) — so a dead/missing token must fail fast and loud
+    rather than hang the whole pipeline indefinitely.
+    """
     creds = None
 
     if TOKEN_FILE.exists():
-        creds = Credentials.from_authorized_user_file(str(TOKEN_FILE), SCOPES)
+        try:
+            creds = Credentials.from_authorized_user_file(str(TOKEN_FILE), SCOPES)
+        except ValueError as e:
+            # Corrupted/incomplete token.json (e.g. missing refresh_token
+            # field) — treat exactly like "no token" rather than crashing
+            # with a raw ValueError that looks like a code bug.
+            log.warning("token.json is unreadable/incomplete (%s) — treating as missing", e)
+            creds = None
 
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
             log.info("Refreshing expired token …")
             creds.refresh(Request())
         else:
-            log.info("Opening browser for first-time authorization …")
-            flow = InstalledAppFlow.from_client_secrets_file(
-                str(CREDENTIALS_FILE), SCOPES
+            log.error(
+                "No valid token.json and no refresh_token available — "
+                "interactive browser consent is required, which is not "
+                "possible on an unattended run."
             )
-            creds = flow.run_local_server(port=0)
+            raise AuthNeedsHumanError(
+                "Gmail OAuth needs a human to re-authorize: token.json is missing, "
+                "invalid, or has no usable refresh_token. Run gmail_fetcher.py "
+                "interactively once on a machine with a browser to mint a fresh "
+                "token.json, then redeploy it to this host."
+            )
 
         TOKEN_FILE.write_text(creds.to_json())
         log.info("Token saved → %s", TOKEN_FILE)
 
     return build("gmail", "v1", credentials=creds)
+
+
+def bootstrap_token(timeout_seconds: int = 180) -> None:
+    """
+    One-time INTERACTIVE setup: opens a real browser for OAuth consent and
+    writes token.json. Run this manually (`python -c "import gmail_fetcher;
+    gmail_fetcher.bootstrap_token()"`) on a machine with a browser before the
+    very first unattended run — authenticate() itself never does this, so a
+    scheduled/headless run can't accidentally trigger a hanging browser popup.
+    """
+    flow = InstalledAppFlow.from_client_secrets_file(str(CREDENTIALS_FILE), SCOPES)
+    creds = flow.run_local_server(port=0, timeout_seconds=timeout_seconds)
+    TOKEN_FILE.write_text(creds.to_json())
+    log.info("Token saved → %s (bootstrap complete)", TOKEN_FILE)
 
 
 def load_processed_ids() -> set:
@@ -78,7 +124,12 @@ def load_processed_ids() -> set:
     return set()
 
 def save_processed_ids(ids: set):
-    PROCESSED_IDS.write_text(json.dumps(list(ids)))
+    # Atomic write — a process kill mid-write must never leave this file
+    # truncated/corrupt, since a JSONDecodeError on the next run's
+    # load_processed_ids() would crash Gmail fetching entirely.
+    tmp = PROCESSED_IDS.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(list(ids)))
+    os.replace(str(tmp), str(PROCESSED_IDS))
 
 def search_emails(service) -> list:
     """Return unprocessed message IDs from all configured senders (last 60 days)."""

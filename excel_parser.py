@@ -5,6 +5,7 @@ Resilient to column insertions, reordering, and minor layout changes.
 """
 
 import openpyxl
+import re
 import logging
 from datetime import datetime
 from pathlib import Path
@@ -60,6 +61,10 @@ KNOWN_SHEET_VARIANTS: list = []
 IGNORED_SHEET_NAMES = {
     "sheet1", "sheet2", "sheet3", "sheet4", "sheet5", "sheet6", "sheet7",
     "shift chart", "completed (2)", "ro water reading",
+    # Formerly read by parse_work_orders() for the old fake work-order KPI,
+    # which was replaced by real Digii Tickets data from a separate source
+    # (parse_ticket_file). Intentionally unused now, not a data gap.
+    "electrical", "plumbing", "stp", "carpentry", "block-1&2 ac issue",
 }
 
 
@@ -79,6 +84,33 @@ def find_sheet(wb, *name_variants: str):
                 log.warning("Sheet fuzzy-matched '%s' -> '%s'", variant, real_name)
                 return wb[real_name]
     raise KeyError(f"Sheet not found. Tried: {name_variants}. Available: {wb.sheetnames}")
+
+
+# Sections that failed to parse this run (label -> error string), populated
+# by _safe_section() and surfaced in each entry-point's result dict as
+# "sectionErrors" so run_pipeline's freshness check can alert on it — a
+# renamed/reworked sheet should blank ONE metric, not silently vanish with
+# no signal at all (see _safe_section docstring for the failure this avoids).
+SECTION_ERRORS: list = []
+
+
+def _safe_section(label: str, fn):
+    """
+    Run a parser section (a lambda calling e.g. parse_eb_dg) and, if it fails
+    with a KeyError (sheet not found — the case find_sheet() itself signals
+    this way) or ValueError (e.g. no date rows found), log a warning and
+    return None instead of propagating. Without this, one renamed/missing
+    sheet raises out of parse_electrical_file() entirely, aborting injection
+    for EVERY section in that file's data — not just the one sheet that
+    changed. Records the failure in SECTION_ERRORS for the freshness check.
+    """
+    try:
+        return fn()
+    except (KeyError, ValueError) as e:
+        msg = f"{label}: {e}"
+        log.warning("Section failed to parse, skipping (dashboard section will show no new data): %s", msg)
+        SECTION_ERRORS.append(msg)
+        return None
 
 
 def detect_unmatched_sheets(wb) -> list:
@@ -166,6 +198,16 @@ def parse_eb_dg(wb, target_month: int, target_year: int) -> dict:
         if cell_date.month != target_month or cell_date.year != target_year:
             continue
         day = cell_date.day
+        # Unlike Solar/Buildings, "HT EB Units" here is a direct daily reading,
+        # not a Final-Initial-Total-unit formula — so a not-yet-reported day
+        # shows up as a genuinely blank cell rather than a negative formula
+        # result. safe_num(None) would silently read as a valid 0 kWh day,
+        # padding the count through the rest of the month, so check the raw
+        # cell before treating this row as real data.
+        eb_cidx = cols.get("eb")
+        if eb_cidx is None or eb_cidx >= len(row) or not isinstance(row[eb_cidx], (int, float)):
+            log.debug("EB&DG: skipping day %d — HT EB Units not yet entered", day)
+            continue
         row_vals = {}
         for key, cidx in cols.items():
             if cidx < len(row):
@@ -245,6 +287,66 @@ def parse_power_cuts(wb, target_month: int, target_year: int) -> list:
     return cuts
 
 
+def parse_power_cuts_all_months(wb) -> dict:
+    """
+    Same 'EB power cut' sheet as parse_power_cuts(), but instead of filtering
+    to one target month, extracts EVERY month's individual outage events into
+    {'YYYY-MM': [event, ...]}. The sheet is a continuous log (back to 2023),
+    so history for past months (e.g. January's Longest Outage / Avg Cut,
+    which need per-event detail, not just a monthly total) is sitting right
+    there — it was just being discarded by the month filter. Keyed events use
+    the same shape as parse_power_cuts()'s list so existing drill-down code
+    (ddPowerCut) works unchanged against any month's list.
+    """
+    ws = find_sheet(wb, "EB power cut", "EB Power cut")
+
+    cols = find_columns(ws, {
+        "from":    ["from"],
+        "to":      ["to"],
+        "dur":     ["total time"],
+        "remarks": ["remarks"],
+    })
+
+    date_col   = 0
+    data_start = find_data_start_row(ws, date_col)
+    by_month   = defaultdict(list)
+    cur_date   = None
+
+    for row in ws.iter_rows(min_row=data_start, values_only=True):
+        cell_date = row[date_col] if row else None
+        if isinstance(cell_date, datetime):
+            cur_date = cell_date
+        if cur_date is None:
+            continue
+        cell_date = cur_date
+
+        dur_val  = row[cols["dur"]]    if "dur"     in cols and cols["dur"]     < len(row) else None
+        from_val = row[cols["from"]]   if "from"    in cols and cols["from"]    < len(row) else None
+        to_val   = row[cols["to"]]     if "to"      in cols and cols["to"]      < len(row) else None
+        rem_val  = row[cols["remarks"]]if "remarks" in cols and cols["remarks"] < len(row) else None
+
+        dur_mins = to_minutes(dur_val)
+        if dur_mins == 0:
+            continue
+
+        start_str = f"{from_val.hour:02d}:{from_val.minute:02d}" if from_val and hasattr(from_val, 'hour') else "00:00"
+        end_str   = f"{to_val.hour:02d}:{to_val.minute:02d}"     if to_val   and hasattr(to_val,   'hour') else "00:00"
+
+        month_key = f"{cell_date.year:04d}-{cell_date.month:02d}"
+        by_month[month_key].append({
+            "date":   f"{cell_date.day:02d}-{cell_date.strftime('%b')}",
+            "start":  start_str,
+            "end":    end_str,
+            "dur":    dur_mins,
+            "events": f"{start_str}-{end_str}",
+            "dg":     str(rem_val) if rem_val else "DG1",
+        })
+
+    log.info("Power cuts (all months) found: %d months, %d total events",
+              len(by_month), sum(len(v) for v in by_month.values()))
+    return dict(by_month)
+
+
 def parse_rm_solar(wb, target_month: int, target_year: int) -> dict:
     ws = find_sheet(wb, "RM Solar panel reading", "RM Solar")
 
@@ -255,7 +357,8 @@ def parse_rm_solar(wb, target_month: int, target_year: int) -> dict:
         "arr":      ["arr block", "arr"],
     }, scan_rows=5)
 
-    # We want the "Total unit" sub-column for each section (+2 offset from the section header)
+    # Sub-columns per section: [0]=Final reading, [2]=Total unit (offsets from section header)
+    final_cols = {k: v for k, v in cols.items()}
     total_cols = {k: v + 2 for k, v in cols.items()}
 
     date_col   = 0
@@ -267,6 +370,14 @@ def parse_rm_solar(wb, target_month: int, target_year: int) -> dict:
         if not isinstance(cell_date, datetime):
             continue
         if cell_date.month != target_month or cell_date.year != target_year:
+            continue
+        # A day with no "Final" reading entered yet isn't real data, even
+        # though the Total-unit formula may evaluate it to 0 or a negative
+        # number (blank treated as 0 in the subtraction) — checking Total
+        # unit alone can't tell "not entered yet" apart from a real reading.
+        finals = [row[final_cols[k]] if final_cols[k] < len(row) else None for k in final_cols]
+        if not all(isinstance(v, (int, float)) for v in finals):
+            log.debug("RM Solar: skipping day %d — Final reading not yet entered", cell_date.day)
             continue
         c = safe_num(row[total_cols["canteen"]]  if total_cols["canteen"]  < len(row) else None)
         h = safe_num(row[total_cols["hostel"]]   if total_cols["hostel"]   < len(row) else None)
@@ -300,6 +411,7 @@ def parse_main_solar(wb, target_month: int, target_year: int) -> dict:
         "admin_lhs":   ["admin lhs", "admin"],
     }, scan_rows=5)
 
+    final_cols = {k: v for k, v in cols.items()}
     total_cols = {k: v + 2 for k, v in cols.items()}
 
     date_col   = 0
@@ -311,6 +423,14 @@ def parse_main_solar(wb, target_month: int, target_year: int) -> dict:
         if not isinstance(cell_date, datetime):
             continue
         if cell_date.month != target_month or cell_date.year != target_year:
+            continue
+        # A day with no "Final" reading entered yet isn't real data, even
+        # though the Total-unit formula may evaluate it to 0 or a negative
+        # number (blank treated as 0 in the subtraction) — checking Total
+        # unit alone can't tell "not entered yet" apart from a real reading.
+        finals = [row[final_cols[k]] if final_cols[k] < len(row) else None for k in final_cols]
+        if not all(isinstance(v, (int, float)) for v in finals):
+            log.debug("Main Solar: skipping day %d — Final reading not yet entered", cell_date.day)
             continue
         p  = safe_num(row[total_cols["pgdm"]]        if total_cols["pgdm"]        < len(row) else None)
         n  = safe_num(row[total_cols["new_acad"]]    if total_cols["new_acad"]    < len(row) else None)
@@ -332,47 +452,265 @@ def parse_main_solar(wb, target_month: int, target_year: int) -> dict:
                                 "bramahputra": bramahputra, "adminLhs": admin_lhs}}
 
 
-def parse_work_orders(wb, target_month: int, target_year: int) -> dict:
-    dept_sheets = {
-        "electrical": ["Electrical"],
-        "ac":         ["AC"],
-        "plumbing":   ["Plumbing"],
-        "stp":        ["STP"],
-        "carpentry":  ["Carpentry"],
-    }
+def parse_ticket_file(file_path: str) -> dict:
+    """
+    Parse the Digii Tickets service-request export (SERVICE_REQUEST sheet).
+    One row per ticket, all-time cumulative history — no month filter, the
+    whole file is the current picture (unlike the daily-rolling reports).
 
-    all_days      = set()
-    dept_counts   = {k: defaultdict(int) for k in dept_sheets}
+    Escalation level is encoded in 'Current Work Centre' as a suffix
+    (_Admin_I / _Admin_II / _Admin_III / _Admin1 / _Admin for IT), which is
+    the FINAL level a ticket reached before being handled — not a per-stage
+    log. Department/problem-type is the sheet's 'Service Name' column.
+    """
+    path = Path(file_path)
+    log.info("Parsing ticket file: %s", path.name)
+    # This export's declared sheet dimensions are wrong (understate real
+    # row/column count), which silently truncates iter_rows() in read-only
+    # mode — load normally instead so the full sheet is actually walked.
+    wb = openpyxl.load_workbook(str(path), data_only=True)
 
-    for key, names in dept_sheets.items():
-        try:
-            ws = find_sheet(wb, *names)
-        except KeyError:
-            log.warning("Work order sheet not found for dept: %s", key)
+    try:
+        ws = find_sheet(wb, "SERVICE_REQUEST", "SERVICE REQUEST", "Service Request")
+    except KeyError as e:
+        raise ValueError(f"Ticket file has no recognizable SERVICE_REQUEST sheet: {e}")
+
+    header = next(ws.iter_rows(min_row=1, max_row=1, max_col=32, values_only=True))
+    header_norm = [normalize(str(c)) if c is not None else "" for c in header]
+    def col(*keywords, default):
+        for i, c in enumerate(header_norm):
+            if any(kw in c for kw in keywords):
+                return i
+        return default
+    id_col     = col("request id", default=0)
+    svc_col    = col("service name", default=1)
+    name_col   = col("name of requester", default=3)
+    status_col = col("status of request", default=5)
+    reqdt_col  = col("request date", default=6)
+    resdt_col  = col("resolved date", default=7)
+    tat_col    = col("turn around time", default=13)
+    wc_col     = col("current work centre", default=11)
+    assign_col = col("assigned to", default=12)
+    max_col = len(header)
+
+    # Generic shared help-desk accounts that route many unrelated tickets —
+    # excluded from recurrence detection since they don't identify one person
+    # with one recurring physical problem.
+    GENERIC_REQUESTERS = {"msh common", "sodexo help desk", "it support desk"}
+
+    LEVEL_SUFFIXES = [
+        ("_admin_iii", "Level 3"),
+        ("_admin_ii",  "Level 2"),
+        ("_admin_i",   "Level 1"),
+        ("_admin1",    "Level 1"),
+        ("_admin",     "Level 1"),
+    ]
+
+    def parse_tat_minutes(s):
+        if not s or not isinstance(s, str) or s.strip() == "--":
+            return None
+        h = re.search(r"(\d+)\s*Hours?", s)
+        m = re.search(r"(\d+)\s*Minutes?", s)
+        if not h and not m:
+            return None
+        return (int(h.group(1)) if h else 0) * 60 + (int(m.group(1)) if m else 0)
+
+    def parse_dt(s):
+        if isinstance(s, datetime):
+            return s
+        if isinstance(s, str) and s.strip():
+            try:
+                return datetime.strptime(s.strip(), "%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                return None
+        return None
+
+    dept_totals = defaultdict(int)
+    level_totals = defaultdict(int)
+    dept_by_level = defaultdict(lambda: defaultdict(int))
+    total_tickets = 0
+    pending_count = 0
+    tat_values = []
+    tickets = []
+    dropped_count = 0
+    dropped_work_centres = set()
+
+    for row in ws.iter_rows(min_row=2, max_row=ws.max_row, max_col=max_col, values_only=True):
+        if not row:
+            continue
+        svc = row[svc_col] if svc_col < len(row) else None
+        wc  = row[wc_col] if wc_col < len(row) else None
+        if not svc or not wc:
             continue
 
-        date_cols = find_columns(ws, {"date": ["complaint date", "complaint\ndate", "date"]})
-        dcol      = date_cols.get("date", 1)
-        data_start = find_data_start_row(ws, dcol)
+        dept = str(svc).strip().rstrip(".")
+        wc_norm = normalize(str(wc))
+        level = next((lbl for suf, lbl in LEVEL_SUFFIXES if wc_norm.endswith(suf)), None)
+        if level is None:
+            # Unrecognized escalation-level suffix (e.g. Digii adds a new
+            # tier, or changes the IT queue's naming) — this ticket vanishes
+            # from every metric below. Unlike a missing sheet, this failure
+            # mode has no natural exception to catch, so it must be counted
+            # explicitly and surfaced, or it silently undercounts forever.
+            dropped_count += 1
+            dropped_work_centres.add(str(wc).strip())
+            continue
 
-        for row in ws.iter_rows(min_row=data_start, values_only=True):
-            if not row or row[0] is None:
-                continue
-            cell_date = row[dcol] if dcol < len(row) else None
-            if not isinstance(cell_date, datetime):
-                continue
-            if cell_date.month != target_month or cell_date.year != target_year:
-                continue
-            dept_counts[key][cell_date.day] += 1
-            all_days.add(cell_date.day)
+        status_raw = row[status_col] if status_col < len(row) else None
+        status = "Pending" if (status_raw and str(status_raw).strip().upper() == "SUBMITTED") else "Resolved"
+        if status == "Pending":
+            pending_count += 1
 
-    days = sorted(all_days)
-    result = {"woDays": days, "woDailyByDept": {}}
-    for key in dept_sheets:
-        result["woDailyByDept"][key] = [dept_counts[key].get(d, 0) for d in days]
+        tat_min = parse_tat_minutes(row[tat_col] if tat_col < len(row) else None)
+        if tat_min is not None:
+            tat_values.append(tat_min)
 
-    totals = {k: sum(v) for k, v in result["woDailyByDept"].items()}
-    log.info("Work order totals: %s", totals)
+        req_date = row[reqdt_col] if reqdt_col < len(row) else None
+        if isinstance(req_date, datetime):
+            req_date_str = req_date.strftime("%Y-%m-%d")
+        elif isinstance(req_date, str) and req_date.strip():
+            # This export stores dates as plain text ("2026-07-07 23:52:12"),
+            # not native Excel datetimes like the other source files.
+            req_date_str = req_date.strip()[:10]
+        else:
+            req_date_str = None
+
+        dept_totals[dept] += 1
+        level_totals[level] += 1
+        dept_by_level[dept][level] += 1
+        total_tickets += 1
+
+        name = row[name_col] if name_col < len(row) else None
+        req_dt = parse_dt(row[reqdt_col] if reqdt_col < len(row) else None)
+        res_dt = parse_dt(row[resdt_col] if resdt_col < len(row) else None)
+
+        tickets.append({
+            "id": row[id_col] if id_col < len(row) else None,
+            "dept": dept,
+            "status": status,
+            "date": req_date_str,
+            "tat": tat_min,
+            "level": level,
+            "assignee": str(row[assign_col]).strip() if assign_col < len(row) and row[assign_col] else None,
+            "_name": str(name).strip() if name else None,
+            "_req_dt": req_dt,
+            "_res_dt": res_dt,
+        })
+
+    avg_tat = round(sum(tat_values) / len(tat_values)) if tat_values else None
+
+    # ── Month-wise breakdown ────────────────────────────────────────────────
+    # The sheet is all-time cumulative with no month filter, but the "current
+    # month" picture (raised this month, resolved this month, by department)
+    # is its own useful KPI — bucket every ticket by its Request Date's
+    # "YYYY-MM" so the dashboard can show a this-month overview alongside the
+    # all-time totals above, and so a future month picker has real data ready.
+    month_totals = defaultdict(int)
+    month_dept = defaultdict(lambda: defaultdict(int))
+    month_pending = defaultdict(int)
+    month_resolved = defaultdict(int)
+    month_tat_values = defaultdict(list)
+    for t in tickets:
+        if not t["date"] or len(t["date"]) < 7:
+            continue
+        month_key = t["date"][:7]  # "YYYY-MM"
+        month_totals[month_key] += 1
+        month_dept[month_key][t["dept"]] += 1
+        if t["status"] == "Pending":
+            month_pending[month_key] += 1
+        else:
+            month_resolved[month_key] += 1
+        if t["tat"] is not None:
+            month_tat_values[month_key].append(t["tat"])
+
+    ticket_months = {}
+    for month_key, total in month_totals.items():
+        tat_vals = month_tat_values.get(month_key) or []
+        ticket_months[month_key] = {
+            "total": total,
+            "pending": month_pending.get(month_key, 0),
+            "resolved": month_resolved.get(month_key, 0),
+            "avgTatMin": round(sum(tat_vals) / len(tat_vals)) if tat_vals else None,
+            "byDept": dict(month_dept[month_key]),
+        }
+
+    now = datetime.now()
+    cur_month_key = f"{now.year:04d}-{now.month:02d}"
+    ticket_this_month = ticket_months.get(cur_month_key, {
+        "total": 0, "pending": 0, "resolved": 0, "avgTatMin": None, "byDept": {},
+    })
+
+    # ── Recurring issue detection ──────────────────────────────────────────
+    # Flag cases where the SAME person's ticket for the SAME problem type was
+    # marked resolved, then they filed another ticket for that same problem
+    # type again within 3 days — a strong signal the original fix didn't
+    # hold. Generic shared help-desk accounts are excluded since they route
+    # many unrelated tickets and don't identify one recurring physical issue.
+    RECURRENCE_WINDOW_DAYS = 3
+    by_person_dept = defaultdict(list)
+    for t in tickets:
+        if not t["_name"] or not t["_req_dt"]:
+            continue
+        key_name = normalize(t["_name"])
+        if key_name in GENERIC_REQUESTERS:
+            continue
+        by_person_dept[(t["_name"], t["dept"])].append(t)
+
+    recurring = []
+    for (name, dept), tix in by_person_dept.items():
+        tix.sort(key=lambda t: t["_req_dt"])
+        for i in range(1, len(tix)):
+            prev, cur = tix[i - 1], tix[i]
+            if prev["status"] != "Resolved" or not prev["_res_dt"]:
+                continue
+            gap_days = (cur["_req_dt"] - prev["_res_dt"]).total_seconds() / 86400
+            if 0 <= gap_days <= RECURRENCE_WINDOW_DAYS:
+                recurring.append({
+                    "name": name,
+                    "dept": dept,
+                    "resolvedDate": prev["_res_dt"].strftime("%Y-%m-%d"),
+                    "reopenedDate": cur["_req_dt"].strftime("%Y-%m-%d"),
+                    "gapDays": round(gap_days, 1),
+                    "priorId": prev["id"],
+                    "newId": cur["id"],
+                })
+
+    recurring_by_dept = defaultdict(int)
+    for r in recurring:
+        recurring_by_dept[r["dept"]] += 1
+
+    for t in tickets:
+        del t["_name"], t["_req_dt"], t["_res_dt"]
+
+    dropped_summary = []
+    if dropped_count:
+        dropped_summary.append(
+            f"{dropped_count} ticket row(s) dropped — unrecognized work centre "
+            f"suffix (not one of {[s for _, s in LEVEL_SUFFIXES]}): "
+            f"{sorted(dropped_work_centres)}"
+        )
+        log.warning(dropped_summary[-1])
+
+    result = {
+        "ticketTotal": total_tickets,
+        "ticketPending": pending_count,
+        "ticketAvgTatMin": avg_tat,
+        "ticketsByDept": dict(dept_totals),
+        "ticketsByLevel": dict(level_totals),
+        "ticketsDeptByLevel": {d: dict(lv) for d, lv in dept_by_level.items()},
+        "ticketRows": tickets,
+        "ticketRecurring": recurring,
+        "ticketRecurringByDept": dict(recurring_by_dept),
+        "ticketMonths": ticket_months,
+        "ticketThisMonth": ticket_this_month,
+        "ticketThisMonthKey": cur_month_key,
+        "ticketDroppedCount": dropped_count,
+        "ticketSectionErrors": dropped_summary,
+    }
+    log.info("Tickets parsed: %d total (%d pending), avg TAT %s min, %d recurring issues, by dept: %s",
+              total_tickets, pending_count, avg_tat, len(recurring), dict(dept_totals))
+    log.info("  This month (%s): %d tickets (%d pending, %d resolved)",
+              cur_month_key, ticket_this_month["total"], ticket_this_month["pending"], ticket_this_month["resolved"])
     return result
 
 
@@ -665,7 +1003,10 @@ def parse_wtp_file(file_path: str, target_month: int = None, target_year: int = 
     wb = openpyxl.load_workbook(str(path), read_only=True, data_only=True)
 
     # ── Auto-detect month/year from the WTP sheet ─────────────────────────────
-    wtp_ws = find_sheet(wb, "TPs", "wtp", "WTP's", "30 TPs", "30 TPs")
+    try:
+        wtp_ws = find_sheet(wb, "TPs", "wtp", "WTP's", "30 TPs", "30 TPs")
+    except KeyError as e:
+        raise ValueError(f"WTP file has no recognizable main sheet (tried 'TPs'/'wtp'/etc): {e}")
     if target_month is None or target_year is None:
         latest = None
         for row in wtp_ws.iter_rows(min_row=3, max_row=5000, values_only=True):
@@ -832,6 +1173,8 @@ BUILDING_SHEETS = [
     ("arrBlock",      "ARR Block",                     "ARR Block"),
     ("thiruvalluvar", "Thiruvalluvar block",           "Thiruvalluvar Block"),
     ("saraswati",     "Saraswati block",               "Saraswati Block"),
+    ("pumpsMotor",    "Pumps& Motor energy consumption", "Pumps & Motor Energy"),
+    ("mainLighting",  "Main lighting panel",          "Main Lighting Panel"),
 ]
 
 
@@ -974,6 +1317,21 @@ def parse_building_panels(wb, sheet_name: str, fallback_label: str,
 
         cell_date = row[0] if row else None
         if not isinstance(cell_date, datetime):
+            i += 1
+            continue
+        # A day with no "Final" reading entered yet (Final sits 2 cols before
+        # Total-unit, same Final/Intial/Total-unit triad as Solar) isn't real
+        # data — its Total-unit formula can evaluate to 0 or a large negative
+        # (blank treated as 0 in the subtraction), neither of which the old
+        # ">= 0 else 0" clamp could tell apart from a genuine reading. Rows
+        # like this get skipped entirely instead of padded in as a 0 day, so
+        # trailing not-yet-reported days don't look like real zero-consumption
+        # days on the dashboard's charts.
+        finals_present = [
+            isinstance(row[col - 2], (int, float)) if 0 <= col - 2 < len(row) else False
+            for _, col in labeled_cols
+        ]
+        if finals_present and not any(finals_present):
             i += 1
             continue
         month_key = f"{cell_date.year:04d}-{cell_date.month:02d}"
@@ -1389,7 +1747,10 @@ def parse_electrical_file(file_path: str, target_month: int = None, target_year:
     wb = openpyxl.load_workbook(str(path), read_only=True, data_only=True)
 
     if target_month is None or target_year is None:
-        ws = find_sheet(wb, "EB&DG Units", "EB&DG Units ")
+        try:
+            ws = find_sheet(wb, "EB&DG Units", "EB&DG Units ")
+        except KeyError as e:
+            raise ValueError(f"Could not detect target month — 'EB&DG Units' sheet not found: {e}")
         latest = None
         for row in ws.iter_rows(min_row=5, values_only=True):
             if isinstance(row[0], datetime):
@@ -1399,14 +1760,19 @@ def parse_electrical_file(file_path: str, target_month: int = None, target_year:
             target_year  = target_year  or latest.year
             log.info("Auto-detected period: %s %d", latest.strftime("%B"), target_year)
         else:
-            raise ValueError("Could not detect target month from Excel file")
+            raise ValueError("Could not detect target month from Excel file — no date rows found in 'EB&DG Units'")
 
     result = {"month": target_month, "year": target_year}
-    result.update(parse_eb_dg(wb, target_month, target_year))
-    result["powerCuts"] = parse_power_cuts(wb, target_month, target_year)
-    result.update(parse_rm_solar(wb, target_month, target_year))
-    result.update(parse_main_solar(wb, target_month, target_year))
-    result.update(parse_work_orders(wb, target_month, target_year))
+
+    # Each section below is independently guarded: a renamed/missing sheet in
+    # ANY one of these must not abort the whole file's parse (and therefore
+    # the whole pipeline run) — it should only blank that one section while
+    # everything else still comes through. See _safe_section() docstring.
+    result.update(_safe_section("EB&DG Units", lambda: parse_eb_dg(wb, target_month, target_year)) or {})
+    result["powerCuts"] = _safe_section("EB power cut", lambda: parse_power_cuts(wb, target_month, target_year)) or []
+    result["powerCutsByMonth"] = _safe_section("EB power cut (all months)", lambda: parse_power_cuts_all_months(wb)) or {}
+    result.update(_safe_section("RM Solar panel reading", lambda: parse_rm_solar(wb, target_month, target_year)) or {})
+    result.update(_safe_section("Solar Panel reading", lambda: parse_main_solar(wb, target_month, target_year)) or {})
 
     # New electrical sub-meters
     ev_by_day = parse_ev_meter(wb, target_month, target_year)
@@ -1435,6 +1801,8 @@ def parse_electrical_file(file_path: str, target_month: int = None, target_year:
     result["unmatchedSheets"] = detect_unmatched_sheets(wb)
     if result["unmatchedSheets"]:
         log.warning("Unrecognized sheet(s) in %s (not parsed): %s", path.name, result["unmatchedSheets"])
+    result["sectionErrors"] = list(SECTION_ERRORS)
+    SECTION_ERRORS.clear()
 
     wb.close()
     log.info("Parsing complete. Days: %s", result.get("days", []))
@@ -1461,7 +1829,10 @@ def parse_cblock_file(file_path: str, target_month: int = None, target_year: int
     wb = openpyxl.load_workbook(str(path), read_only=False, data_only=True)
 
     if target_month is None or target_year is None:
-        ws = find_sheet(wb, "C-block Reading", "C-Block Reading")
+        try:
+            ws = find_sheet(wb, "C-block Reading", "C-Block Reading")
+        except KeyError as e:
+            raise ValueError(f"C-Block file has no recognizable main sheet: {e}")
         latest = None
         for row in ws.iter_rows(min_row=1, max_row=5, values_only=True):
             for cell in row:
@@ -1655,4 +2026,3 @@ if __name__ == "__main__":
     print(f"junStock   : {data.get('junStock', [])[:5]} ...")
     print(f"Power cuts : {len(data.get('powerCuts', []))} events")
     print(f"RM Solar   : {data.get('rmSolarDaily', {}).get('canteen', [])[:5]} ...")
-    print(f"WO elec    : {data.get('woDailyByDept', {}).get('electrical', [])[:5]} ...")

@@ -4,6 +4,7 @@ Takes parsed Excel data and injects it into the HTML dashboard,
 replacing hardcoded JS arrays with fresh values from the Excel file.
 """
 
+import os
 import re
 import logging
 import shutil
@@ -110,21 +111,162 @@ def build_power_cuts(cuts: list) -> str:
     return f"const curPowerCuts = [\n{inner},\n];"
 
 
-def build_wo_daily(wo: dict) -> str:
-    e = fmt_array(wo.get("electrical", []))
-    s = fmt_array(wo.get("stp",        []))
-    p = fmt_array(wo.get("plumbing",   []))
-    a = fmt_array(wo.get("ac",         []))
-    c = fmt_array(wo.get("carpentry",  []))
+def build_power_cuts_by_month(by_month: dict) -> str:
+    """
+    Every month's individual outage events, keyed 'YYYY-MM', so Longest
+    Outage / Avg Cut can be computed for ANY month with event-level history
+    in the source sheet — not just the live month and the one hardcoded
+    Feb-2026 backfill. Same event shape (date/start/end/dur/events/dg) as
+    curPowerCuts/powerCutsFeb, so existing drill-down code needs no changes.
+    """
+    month_entries = []
+    for month_key in sorted(by_month.keys()):
+        events = by_month[month_key]
+        event_json = ",".join(
+            "{" +
+            f"date:{fmt_str(e['date'])},start:{fmt_str(e['start'])},end:{fmt_str(e['end'])},"
+            f"dur:{e['dur']},events:{fmt_str(e['events'])},dg:{fmt_str(e['dg'])}"
+            + "}"
+            for e in events
+        )
+        month_entries.append(f"{fmt_str(month_key)}:[{event_json}]")
+    return "const powerCutsByMonth = {" + ",".join(month_entries) + "};"
+
+
+def _js_escape_structural(s: str) -> str:
+    """
+    Escape every character replace_var's balanced-bracket scanner treats as
+    structurally significant — '[', ']', '{', '}', ';' — using JS \\uXXXX
+    escapes, so the ENCODED string literal never contains a raw one of these
+    characters. Without this, free-text Excel fields (an assignee name, a
+    department rename, a pasted remark) containing a stray bracket/brace can
+    close the scanner's balanced match one token early and splice stale
+    leftover JS into the next run's injected block — a real, reproduced
+    corruption path, not a theoretical one. Also escapes '<' defensively
+    (an inline </script> substring would end the containing <script> tag).
+    """
     return (
-        "const woDailyByDept = {\n"
-        f"  electrical:{e},\n"
-        f"  stp:       {s},\n"
-        f"  plumbing:  {p},\n"
-        f"  ac:        {a},\n"
-        f"  carpentry: {c}\n"
-        "};"
+        str(s)
+        .replace("\\", "\\\\")
+        .replace("'", "\\'")
+        .replace("[", "\\u005B").replace("]", "\\u005D")
+        .replace("{", "\\u007B").replace("}", "\\u007D")
+        .replace(";", "\\u003B")
+        .replace("<", "\\u003C")
+        .replace("\n", "\\n").replace("\r", "")
     )
+
+
+def fmt_str(s: str) -> str:
+    return "'" + _js_escape_structural(s) + "'"
+
+
+def fmt_str_array(values: list) -> str:
+    return "[" + ",".join(fmt_str(v) for v in values) + "]"
+
+
+def inject_tickets(html: str, data: dict) -> str:
+    """
+    Digii Tickets — all-time cumulative counts from the service-request
+    export (not month-indexed like everything else; the source file is
+    always the full history, so we just re-emit fresh totals each run).
+    """
+    by_dept = data.get("ticketsByDept") or {}
+    by_level = data.get("ticketsByLevel") or {}
+    dept_by_level = data.get("ticketsDeptByLevel") or {}
+
+    dept_labels = sorted(by_dept.keys(), key=lambda d: -by_dept[d])
+    dept_vals = [by_dept[d] for d in dept_labels]
+
+    levels = ["Level 1", "Level 2", "Level 3"]
+    level_vals = [by_level.get(lv, 0) for lv in levels]
+
+    dept_json = ",".join(
+        f"{{dept:{fmt_str(d)},l1:{dept_by_level.get(d, {}).get('Level 1', 0)},"
+        f"l2:{dept_by_level.get(d, {}).get('Level 2', 0)},"
+        f"l3:{dept_by_level.get(d, {}).get('Level 3', 0)}}}"
+        for d in dept_labels
+    )
+
+    html = replace_var(html, "ticketsByDept",
+        f"const ticketsByDept = {{labels:{fmt_str_array(dept_labels)},vals:{fmt_array(dept_vals)}}};")
+    html = replace_var(html, "ticketsByLevel",
+        f"const ticketsByLevel = {{labels:{fmt_str_array(levels)},vals:{fmt_array(level_vals)}}};")
+    html = replace_var(html, "ticketsDeptByLevel", f"const ticketsDeptByLevel = [{dept_json}];")
+    html = replace_var(html, "ticketTotal", f"const ticketTotal = {data.get('ticketTotal', 0)};")
+    html = replace_var(html, "ticketPending", f"const ticketPending = {data.get('ticketPending', 0) or 0};")
+    avg_tat = data.get("ticketAvgTatMin")
+    html = replace_var(html, "ticketAvgTatMin", f"const ticketAvgTatMin = {avg_tat if avg_tat is not None else 'null'};")
+
+    rows = data.get("ticketRows") or []
+    row_json = ",".join(
+        "{" +
+        f"id:{fmt_str(r['id']) if r.get('id') is not None else 'null'},"
+        f"dept:{fmt_str(r['dept'])},"
+        f"status:{fmt_str(r['status'])},"
+        f"date:{fmt_str(r['date']) if r.get('date') else 'null'},"
+        f"tat:{r['tat'] if r.get('tat') is not None else 'null'},"
+        f"level:{fmt_str(r['level'])},"
+        f"assignee:{fmt_str(r['assignee']) if r.get('assignee') else 'null'}"
+        + "}"
+        for r in rows
+    )
+    html = replace_var(html, "ticketRows", f"const ticketRows = [{row_json}];")
+
+    recurring = data.get("ticketRecurring") or []
+    recurring_json = ",".join(
+        "{" +
+        f"name:{fmt_str(r['name'])},"
+        f"dept:{fmt_str(r['dept'])},"
+        f"resolvedDate:{fmt_str(r['resolvedDate'])},"
+        f"reopenedDate:{fmt_str(r['reopenedDate'])},"
+        f"gapDays:{r['gapDays']},"
+        f"priorId:{fmt_str(r['priorId']) if r.get('priorId') is not None else 'null'},"
+        f"newId:{fmt_str(r['newId']) if r.get('newId') is not None else 'null'}"
+        + "}"
+        for r in recurring
+    )
+    html = replace_var(html, "ticketRecurring", f"const ticketRecurring = [{recurring_json}];")
+
+    recurring_by_dept = data.get("ticketRecurringByDept") or {}
+    rbd_labels = sorted(recurring_by_dept.keys(), key=lambda d: -recurring_by_dept[d])
+    rbd_vals = [recurring_by_dept[d] for d in rbd_labels]
+    html = replace_var(html, "ticketRecurringByDept",
+        f"const ticketRecurringByDept = {{labels:{fmt_str_array(rbd_labels)},vals:{fmt_array(rbd_vals)}}};")
+
+    # This-month overview — same all-time sheet, bucketed by Request Date so
+    # the dashboard can show "raised this month" alongside the all-time totals.
+    this_month = data.get("ticketThisMonth") or {"total": 0, "pending": 0, "resolved": 0, "avgTatMin": None, "byDept": {}}
+    tm_by_dept = this_month.get("byDept") or {}
+    tm_labels = sorted(tm_by_dept.keys(), key=lambda d: -tm_by_dept[d])
+    tm_vals = [tm_by_dept[d] for d in tm_labels]
+    tm_avg_tat = this_month.get("avgTatMin")
+    html = replace_var(html, "ticketThisMonth",
+        f"const ticketThisMonth = {{total:{this_month.get('total', 0)},"
+        f"pending:{this_month.get('pending', 0)},"
+        f"resolved:{this_month.get('resolved', 0)},"
+        f"avgTatMin:{tm_avg_tat if tm_avg_tat is not None else 'null'},"
+        f"byDept:{{labels:{fmt_str_array(tm_labels)},vals:{fmt_array(tm_vals)}}}}};")
+    html = replace_var(html, "ticketThisMonthKey",
+        f"const ticketThisMonthKey = {fmt_str(data.get('ticketThisMonthKey', ''))};")
+
+    # Monthly trend — total tickets raised per month across every month the
+    # export has history for (currently Jul 2025 onward), sorted chronologically.
+    ticket_months = data.get("ticketMonths") or {}
+    month_keys_sorted = sorted(ticket_months.keys())
+    trend_json = ",".join(
+        f"{{month:{fmt_str(mk)},total:{ticket_months[mk].get('total', 0)},"
+        f"pending:{ticket_months[mk].get('pending', 0)},"
+        f"resolved:{ticket_months[mk].get('resolved', 0)}}}"
+        for mk in month_keys_sorted
+    )
+    html = replace_var(html, "ticketMonthlyTrend", f"const ticketMonthlyTrend = [{trend_json}];")
+
+    log.info("Tickets injected: %d total (%d pending) across %d departments, %d rows, %d recurring issues, "
+              "%d this month",
+              data.get("ticketTotal", 0), data.get("ticketPending", 0) or 0, len(dept_labels), len(rows), len(recurring),
+              this_month.get("total", 0))
+    return html
 
 
 def build_wtp_daily(wtp: dict) -> str:
@@ -166,15 +308,6 @@ def inject_wtp(html: str, data: dict) -> str:
     return html
 
 
-def build_wo_totals(wo: dict) -> str:
-    e = sum(wo.get("electrical", []))
-    s = sum(wo.get("stp",        []))
-    p = sum(wo.get("plumbing",   []))
-    a = sum(wo.get("ac",         []))
-    c = sum(wo.get("carpentry",  []))
-    return f"const woTotals = {{e:{e},s:{s},p:{p},a:{a},c:{c}}};"
-
-
 # ── Regex replacers ───────────────────────────────────────────────────────────
 
 def replace_var(html: str, var_name: str, new_block: str) -> str:
@@ -199,22 +332,26 @@ def replace_var(html: str, var_name: str, new_block: str) -> str:
         val_start += 1
 
     opener = html[val_start]
-    closer = ']' if opener == '[' else '}'
-    depth = 0
-    pos = val_start
-    while pos < len(html):
-        if html[pos] == opener:
-            depth += 1
-        elif html[pos] == closer:
-            depth -= 1
-            if depth == 0:
-                break
-        pos += 1
+    if opener not in ('[', '{'):
+        # Scalar value (number/string/bool) — ends at the next semicolon.
+        end = html.index(';', val_start) + 1
+    else:
+        closer = ']' if opener == '[' else '}'
+        depth = 0
+        pos = val_start
+        while pos < len(html):
+            if html[pos] == opener:
+                depth += 1
+            elif html[pos] == closer:
+                depth -= 1
+                if depth == 0:
+                    break
+            pos += 1
 
-    # pos is now at the closing bracket; skip optional semicolon
-    end = pos + 1
-    if end < len(html) and html[end] == ';':
-        end += 1
+        # pos is now at the closing bracket; skip optional semicolon
+        end = pos + 1
+        if end < len(html) and html[end] == ';':
+            end += 1
 
     new_html = html[:idx] + new_block + html[end:]
     log.info("Updated: %s", var_name)
@@ -447,47 +584,6 @@ def update_monthly_totals(html: str, data: dict) -> str:
         html = replace_var(html, "sathiyaMonthly", f"const sathiyaMonthly={fmt_array(arr)};")
         log.info("sathiyaMonthly[%d] = %s", mon_idx, sathiya_total)
 
-    # ── woMonthlyTotals ───────────────────────────────────────────────────────
-    wo_total = sum(sum(v) for v in data.get("woDailyByDept", {}).values())
-    if wo_total:
-        arr = _set_index(_extract_flat_array(html, "woMonthlyTotals"), mon_idx, wo_total)
-        html = replace_var(html, "woMonthlyTotals", f"const woMonthlyTotals={fmt_array(arr)};")
-        log.info("woMonthlyTotals[%d] = %s", mon_idx, wo_total)
-
-    # ── woByDept (cumulative totals per dept) ─────────────────────────────────
-    wo_dept = data.get("woDailyByDept", {})
-    if wo_dept:
-        e = sum(wo_dept.get("electrical", []))
-        s = sum(wo_dept.get("stp",        []))
-        p = sum(wo_dept.get("plumbing",   []))
-        a = sum(wo_dept.get("ac",         []))
-        c = sum(wo_dept.get("carpentry",  []))
-        html = replace_var(html, "woByDept",
-            f"const woByDept={{labels:['Electrical','STP','Plumbing','AC','Carpentry'],vals:[{e},{s},{p},{a},{c}]}};")
-        log.info("woByDept updated: e=%d s=%d p=%d a=%d c=%d", e, s, p, a, c)
-
-        # ── woMonthly (per-department monthly breakdown, index = month-1) ──────
-        m = re.search(r'const\s+woMonthly\s*=\s*\{([^}]*)\}', html)
-        if m:
-            body = m.group(1)
-            wm = {}
-            for k in ["electrical", "stp", "plumbing", "ac", "carpentry"]:
-                sm = re.search(rf'{k}:\[([^\]]*)\]', body)
-                wm[k] = [float(x.strip()) for x in sm.group(1).split(',') if x.strip()] if sm else []
-            wm["electrical"] = _set_index(wm["electrical"], mon_idx, e)
-            wm["stp"]        = _set_index(wm["stp"],        mon_idx, s)
-            wm["plumbing"]   = _set_index(wm["plumbing"],   mon_idx, p)
-            wm["ac"]         = _set_index(wm["ac"],         mon_idx, a)
-            wm["carpentry"]  = _set_index(wm["carpentry"],  mon_idx, c)
-            new_block = (
-                f"const woMonthly={{electrical:{fmt_array(wm['electrical'])},"
-                f"stp:{fmt_array(wm['stp'])},"
-                f"plumbing:{fmt_array(wm['plumbing'])},"
-                f"ac:{fmt_array(wm['ac'])},"
-                f"carpentry:{fmt_array(wm['carpentry'])}}};")
-            html = replace_var(html, "woMonthly", new_block)
-            log.info("woMonthly[%d] updated", mon_idx)
-
     # ── rmSolarMonthly ────────────────────────────────────────────────────────
     rm = data.get("rmSolarDaily", {})
     if rm.get("canteen"):
@@ -553,8 +649,13 @@ def update_monthly_totals(html: str, data: dict) -> str:
 
 
 def _js_str(s: str) -> str:
-    """Escape a Python string for embedding in a single-quoted JS string literal."""
-    return str(s).replace("\\", "\\\\").replace("'", "\\'")
+    """
+    Escape a Python string for embedding in a single-quoted JS string literal.
+    Delegates to _js_escape_structural so brackets/braces/semicolons from
+    free-text Excel fields can't break replace_var's balanced-bracket scanner
+    (see that function's docstring) — this and fmt_str must stay in sync.
+    """
+    return _js_escape_structural(s)
 
 
 def inject_facility(html: str, data: dict) -> str:
@@ -769,12 +870,12 @@ def inject(data: dict, dashboard_path: str = None) -> str:
 
     # 4 — Power cuts
     html = replace_var(html, "curPowerCuts", build_power_cuts(data["powerCuts"]))
+    if data.get("powerCutsByMonth"):
+        html = replace_var(html, "powerCutsByMonth", build_power_cuts_by_month(data["powerCutsByMonth"]))
 
-    # 5 — Work orders daily
-    html = replace_var(html, "woDailyByDept", build_wo_daily(data["woDailyByDept"]))
-
-    # 6 — Work order totals
-    html = replace_var(html, "woTotals", build_wo_totals(data["woDailyByDept"]))
+    # 5 — Digii Tickets (all-time cumulative, re-emitted fresh each run)
+    if data.get("ticketsByDept"):
+        html = inject_tickets(html, data)
 
     # 7 — WTP / water data (injected only when wtp data is present in payload)
     if "wtpDaily" in data:
@@ -805,7 +906,17 @@ def inject(data: dict, dashboard_path: str = None) -> str:
     # 14 — Past Reports archive list
     html = inject_report_archive(html)
 
-    path.write_text(html, encoding="utf-8")
+    # Write to a temp file in the same directory, then atomically swap it in.
+    # A direct path.write_text() truncates the live file before writing the
+    # new content — if the process is killed mid-write (Task Scheduler
+    # timeout, host OOM-kill, forced reboot), the live dashboard is left
+    # truncated/corrupt and stays that way until a human notices and manually
+    # restores a .backup_*.html. os.replace() is a single atomic rename on
+    # both Windows and POSIX, so the live file is always either the old
+    # complete version or the new complete version — never a partial write.
+    tmp_path = path.with_suffix(path.suffix + f".tmp{datetime.now().strftime('%Y%m%d_%H%M%S%f')}")
+    tmp_path.write_text(html, encoding="utf-8")
+    os.replace(str(tmp_path), str(path))
 
     log.info("Dashboard updated: %s  (%d chars -> %d chars)", path.name, original_len, len(html))
     return str(path)
