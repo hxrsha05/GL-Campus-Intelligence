@@ -32,8 +32,7 @@ Gmail Inbox → Excel Fetch → Parse & Validate → Data Injection → Live Das
 - Null-vs-zero aware rendering — a genuine zero reading is never confused with missing data
 
 ### Reporting
-- Dashboard HTML emailed automatically: once per day at end of day (guaranteed), plus immediately whenever a genuinely new day of electrical/EB&DG data lands mid-day
-- A short text-only confirmation is sent at end of day instead of a duplicate attachment if the dashboard already went out earlier that day
+- Dashboard HTML emailed automatically: guaranteed at 11 AM and 8 PM every day regardless of whether anything changed (8 PM exists as a safety net in case the 11 AM email is delayed or missed), plus immediately whenever a genuinely new day of electrical/EB&DG data lands at any other hour
 - Monthly PDF archival for long-term recordkeeping
 - Freshness and anomaly alerts sent automatically if expected data doesn't arrive
 

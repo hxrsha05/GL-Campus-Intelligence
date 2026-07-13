@@ -701,14 +701,16 @@ def inject_facility(html: str, data: dict) -> str:
     return html
 
 
-def _extract_existing_building_keys(html: str) -> set:
+def _extract_existing_building_blocks(html: str) -> dict:
     """
-    Return the set of building keys already present in the HTML's BUILDINGS
-    object, without fully parsing it — just enough to know what NOT to lose.
+    Return {key: raw_js_object_text} for every building already present in the
+    HTML's BUILDINGS object, without fully parsing the JS — just enough to
+    splice a key's existing block back in verbatim if this run's source file
+    doesn't have fresh data for it.
     """
     m = re.search(r'const\s+BUILDINGS\s*=\s*\{', html)
     if not m:
-        return set()
+        return {}
     start = m.end() - 1
     depth, pos = 0, start
     while pos < len(html):
@@ -717,38 +719,44 @@ def _extract_existing_building_keys(html: str) -> set:
             depth -= 1
             if depth == 0: break
         pos += 1
-    body = html[start:pos + 1]
-    return set(re.findall(r"(\w+):\{days:\[", body))
+    body = html[start + 1:pos]  # contents between the outer { and }
+
+    blocks = {}
+    for km in re.finditer(r"(\w+):\{days:\[", body):
+        key = km.group(1)
+        obj_start = km.start(1) + len(key) + 1  # position of the '{' right after "key:"
+        d, p = 0, obj_start
+        while p < len(body):
+            if body[p] == '{': d += 1
+            elif body[p] == '}':
+                d -= 1
+                if d == 0: break
+            p += 1
+        blocks[key] = body[obj_start:p + 1]
+    return blocks
 
 
 def inject_buildings(html: str, data: dict) -> str:
     """
     Inject the per-building sub-meter panel data (Buildings section).
-    This REPLACES the whole BUILDINGS object each run, so if this run's
-    source file is missing a sheet that a previous, more complete run had
-    (e.g. an older-layout electrical report got picked up), that building
-    would silently vanish from the dashboard. Guard against that: only
-    proceed if this run's building set is not a strict regression — i.e. it
-    covers at least the keys already on disk, or there simply weren't any
-    keys on disk yet.
+    Rebuilds the block for every key this run actually parsed fresh data
+    for, and preserves the existing on-disk block verbatim for any key this
+    run's source file didn't have (e.g. one renamed/missing sheet) — a bad
+    sheet for building X must not also freeze buildings Y and Z that DID
+    parse fine this run.
     """
     buildings = data.get("buildings")
     if not buildings:
         return html
 
-    existing_keys = _extract_existing_building_keys(html)
-    missing = existing_keys - buildings.keys()
+    existing_blocks = _extract_existing_building_blocks(html)
+    missing = existing_blocks.keys() - buildings.keys()
     if missing:
         log.warning(
             "BUILDINGS: this run's source file is missing sheets for %s (present on disk from a "
-            "prior run) — keeping those untouched instead of deleting them.",
+            "prior run) — keeping those untouched, updating every other building normally.",
             ", ".join(sorted(missing)),
         )
-        # Can't recover the old per-building data from the new `data` dict (it
-        # was never parsed this run), so we leave those keys out of the
-        # rewritten object only if we truly have no way to preserve them.
-        # Safer default: refuse to shrink the building set at all.
-        return html
 
     parts = []
     for key, b in buildings.items():
@@ -765,6 +773,8 @@ def inject_buildings(html: str, data: dict) -> str:
         parts.append(
             f"{key}:{{days:[{days}],panels:[{panels}],monthlyTotals:{{{monthly_totals}}}}}"
         )
+    for key in sorted(missing):
+        parts.append(f"{key}:{existing_blocks[key]}")
 
     new_block = "const BUILDINGS={" + ",".join(parts) + "};"
     html = replace_var(html, "BUILDINGS", new_block)
@@ -883,7 +893,7 @@ def inject(data: dict, dashboard_path: str = None) -> str:
 
     # 8 — Electrical sub-meters (EV, tenants, laundromat elec)
     for key in ["evDailyKWh", "nescafeDailyKWh", "cvbDailyKWh", "teaDailyKWh",
-                "yummyDailyKWh", "laundryElecKWh"]:
+                "yummyDailyKWh", "lavasaDailyKWh", "laundryElecKWh"]:
         val = data.get(key)
         if val is not None:
             html = replace_var(html, key, f"const {key} = {fmt_array(val)};")

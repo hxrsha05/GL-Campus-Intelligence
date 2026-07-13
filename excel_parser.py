@@ -870,9 +870,9 @@ def parse_tds(wb, target_month: int, target_year: int) -> dict:
         ro1000_vals = [safe_num(row[c] if len(row) > c else None)
                        for c in [1, 2, 4, 5, 7, 8]
                        if isinstance(row[c] if len(row) > c else None, (int, float))]
-        # RO-2000: cols 11,12,14,15,17,18
+        # RO-2000: cols 10,11,13,14,16,17 (no spacer col before this block, unlike RO-1000)
         ro2000_vals = [safe_num(row[c] if len(row) > c else None)
-                       for c in [11, 12, 14, 15, 17, 18]
+                       for c in [10, 11, 13, 14, 16, 17]
                        if isinstance(row[c] if len(row) > c else None, (int, float))]
         ro1_avg = round(sum(ro1000_vals) / len(ro1000_vals), 1) if ro1000_vals else 0
         ro2_avg = round(sum(ro2000_vals) / len(ro2000_vals), 1) if ro2000_vals else 0
@@ -935,16 +935,16 @@ def parse_ev_meter(wb, target_month: int, target_year: int) -> dict:
     return result
 
 
-def parse_tenant_meter(wb, sheet_name: str, target_month: int, target_year: int) -> dict:
+def parse_tenant_meter(wb, *sheet_name_variants: str, target_month: int, target_year: int) -> dict:
     """
     Parse a tenant sub-meter sheet (Nescafe, Chennai Beverage, etc).
     Header at row 1/2, data at row 3+. Col 3 = Total unit.
     Handles negative values (meter reset) by treating as 0.
     """
     try:
-        ws = find_sheet(wb, sheet_name)
+        ws = find_sheet(wb, *sheet_name_variants)
     except KeyError:
-        log.warning("Tenant sheet not found: %s", sheet_name)
+        log.warning("Tenant sheet not found: %s", sheet_name_variants)
         return {}
 
     data_start = find_data_start_row(ws, 0)
@@ -1776,10 +1776,11 @@ def parse_electrical_file(file_path: str, target_month: int = None, target_year:
 
     # New electrical sub-meters
     ev_by_day = parse_ev_meter(wb, target_month, target_year)
-    nescafe_by_day    = parse_tenant_meter(wb, "Nescafe coffee shop meter", target_month, target_year)
-    cvb_by_day        = parse_tenant_meter(wb, "Chennai Beverage shop", target_month, target_year)
-    tea_by_day        = parse_tenant_meter(wb, "Tea wheeler shop", target_month, target_year)
-    yummy_by_day      = parse_tenant_meter(wb, "Yummpy's shop", target_month, target_year)
+    nescafe_by_day    = parse_tenant_meter(wb, "Nescafe coffee shop meter", target_month=target_month, target_year=target_year)
+    cvb_by_day        = parse_tenant_meter(wb, "Chennai Beverage shop", target_month=target_month, target_year=target_year)
+    tea_by_day        = parse_tenant_meter(wb, "Tea wheeler shop", target_month=target_month, target_year=target_year)
+    yummy_by_day      = parse_tenant_meter(wb, "Yummpy's shop", target_month=target_month, target_year=target_year)
+    lavasa_by_day     = parse_tenant_meter(wb, "Lavasa shop", "Lavasa Shop", target_month=target_month, target_year=target_year)
     laundry_elec      = parse_laundry_elec(wb, target_month, target_year)
 
     days = result.get("days", [])
@@ -1788,6 +1789,7 @@ def parse_electrical_file(file_path: str, target_month: int = None, target_year:
     result["cvbDailyKWh"]      = [cvb_by_day.get(d, 0)      for d in days]
     result["teaDailyKWh"]      = [tea_by_day.get(d, 0)      for d in days]
     result["yummyDailyKWh"]    = [yummy_by_day.get(d, 0)    for d in days]
+    result["lavasaDailyKWh"]   = [lavasa_by_day.get(d, 0)   for d in days]
     result["laundryElecKWh"]   = [laundry_elec.get(d, 0)    for d in days]
 
     # Facility sections previously hardcoded in the dashboard

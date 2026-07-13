@@ -39,13 +39,14 @@ DIVIDER   = "-" * 65
 
 ALERT_FALLBACK_FILE = BASE_DIR / "ALERT_UNDELIVERED.txt"
 LAST_REPORT_SENT_FILE = BASE_DIR / "LAST_REPORT_SENT.txt"
-LAST_NOTICE_SENT_FILE = BASE_DIR / "LAST_NOTICE_SENT.txt"
 
-# Hour (24h, local time) of the guaranteed once-daily send — fires even if
-# nothing changed since the last email, so there's always a final end-of-day
-# copy regardless of how many (or how few) mid-day change-triggered sends
-# happened. Matches the scheduler's 8AM-11PM hourly window (setup_scheduler.ps1).
-GUARANTEED_SEND_HOUR = 20  # 8 PM
+# Hours (24h, local time) of the guaranteed sends — each one fires even if
+# nothing changed since the last email, so there's always a dashboard copy
+# at these two checkpoints regardless of how many (or how few) mid-day
+# change-triggered sends happened in between. Matches the scheduler's
+# 8AM-11PM hourly window (setup_scheduler.ps1) — both hours must fall
+# inside that window to actually get a pipeline run to check them.
+GUARANTEED_SEND_HOURS = [11, 20]  # 11 AM, 8 PM
 
 
 def _significant_signal(data: dict) -> dict:
@@ -87,7 +88,13 @@ def _data_fingerprint(data: dict) -> str:
 
 
 def _load_report_sent_state() -> dict:
-    """{'date': 'YYYY-MM-DD', 'fingerprint': '...'} of the last successful send, or {}."""
+    """
+    {'date': 'YYYY-MM-DD', 'fingerprint': '...', 'guaranteedSent': [11, 20]}
+    of the last successful send, or {}. guaranteedSent tracks which of
+    GUARANTEED_SEND_HOURS have already sent the full dashboard TODAY — each
+    guaranteed hour is independent and unconditional, so 8 PM still sends
+    its own copy even though 11 AM already sent one earlier the same day.
+    """
     import json
     if not LAST_REPORT_SENT_FILE.exists():
         return {}
@@ -99,19 +106,17 @@ def _load_report_sent_state() -> dict:
 
 def _should_send_report(data: dict) -> tuple:
     """
-    Decide what this run should email, and why (for logging). Returns
-    (action, reason) where action is one of:
+    Decide whether this run should email the full dashboard HTML, and why
+    (for logging). Returns (action, reason) where action is either
+    "dashboard" or None:
       "dashboard" — send the full dashboard HTML. Fires when either the data
-          changed since the last send (an early-morning correction/late entry
-          landing mid-day), or it's the guaranteed end-of-day hour and no
-          dashboard has gone out at all yet today.
-      "notice"    — the guaranteed end-of-day hour arrived, but a dashboard
-          was already emailed earlier today (data-change trigger) and
-          nothing has changed since — send a short text-only confirmation
-          instead of a redundant HTML re-attachment, so 8 PM always produces
-          SOME email confirming the system is alive, just not a duplicate.
+          changed since the last send (a new day's electrical/EB&DG data
+          landing mid-day), or the current hour is one of
+          GUARANTEED_SEND_HOURS and that specific slot hasn't already sent
+          today — this fires unconditionally, even if nothing changed, so
+          11 AM and 8 PM always deliver a real dashboard copy.
       None        — nothing to send (already covered by an earlier run this
-          hour, or before the guaranteed hour with no data change).
+          hour, or outside a guaranteed hour with no data change).
     """
     state = _load_report_sent_state()
     today = datetime.now().strftime("%Y-%m-%d")
@@ -120,39 +125,28 @@ def _should_send_report(data: dict) -> tuple:
     if fingerprint != state.get("fingerprint"):
         return "dashboard", "data changed since last send"
 
-    now = datetime.now()
-    if now.hour >= GUARANTEED_SEND_HOUR:
-        if state.get("date") != today:
-            return "dashboard", f"guaranteed end-of-day send ({GUARANTEED_SEND_HOUR}:00+, not yet sent today)"
-        if _last_notice_date() != today:
-            return "notice", f"guaranteed end-of-day check ({GUARANTEED_SEND_HOUR}:00+) — dashboard already sent today, sending confirmation notice instead"
+    guaranteed_sent = state.get("guaranteedSent", []) if state.get("date") == today else []
+    now_hour = datetime.now().hour
+    for slot in GUARANTEED_SEND_HOURS:
+        if now_hour == slot and slot not in guaranteed_sent:
+            return "dashboard", f"guaranteed send for {slot}:00 (not yet sent this slot today)"
 
-    return None, "no data change and guaranteed send/notice already done today"
-
-
-def _last_notice_date() -> str:
-    if not LAST_NOTICE_SENT_FILE.exists():
-        return ""
-    try:
-        return LAST_NOTICE_SENT_FILE.read_text(encoding="utf-8").strip()
-    except OSError:
-        return ""
+    return None, "no data change and no guaranteed slot due right now"
 
 
-def _mark_notice_sent() -> None:
-    import os
-    tmp = LAST_NOTICE_SENT_FILE.with_suffix(".tmp")
-    tmp.write_text(datetime.now().strftime("%Y-%m-%d"), encoding="utf-8")
-    os.replace(str(tmp), str(LAST_NOTICE_SENT_FILE))
-
-
-def _mark_report_sent(data: dict) -> None:
+def _mark_report_sent(data: dict, slot_hour: int = None) -> None:
     import os
     import json
+    today = datetime.now().strftime("%Y-%m-%d")
+    prev = _load_report_sent_state()
+    guaranteed_sent = prev.get("guaranteedSent", []) if prev.get("date") == today else []
+    if slot_hour is not None and slot_hour not in guaranteed_sent:
+        guaranteed_sent.append(slot_hour)
     state = {
-        "date": datetime.now().strftime("%Y-%m-%d"),
+        "date": today,
         "time": datetime.now().strftime("%I:%M %p"),
         "fingerprint": _data_fingerprint(data),
+        "guaranteedSent": guaranteed_sent,
     }
     tmp = LAST_REPORT_SENT_FILE.with_suffix(".tmp")
     tmp.write_text(json.dumps(state), encoding="utf-8")
@@ -316,24 +310,6 @@ def send_freshness_alert(problems: list[str]) -> None:
         + "\n".join(f"  - {p}" for p in problems)
         + f"\n\nThe dashboard file was still updated — please double-check it before "
         f"relying on it. Full log: {LOG_FILE}"
-    )
-
-
-def send_end_of_day_notice(sent_at: str) -> None:
-    """
-    Text-only confirmation sent at the guaranteed end-of-day hour when a
-    dashboard copy already went out earlier today (data-change trigger) and
-    nothing has changed since — confirms the system is alive and today's
-    data is already in your inbox, without re-attaching the same HTML file.
-    """
-    now = datetime.now().strftime('%d %b %Y, %I:%M %p')
-    _send_alert_email(
-        'GL Campus Intelligence — No New Update (Today\'s Dashboard Already Sent)',
-        f"Checked at {now}: no new data since today's dashboard update was "
-        f"already emailed at {sent_at}.\n\n"
-        f"Nothing further to send — you already have the latest version. "
-        f"This is just a confirmation that the pipeline is running normally.\n\n"
-        f"Full log: {LOG_FILE}"
     )
 
 
@@ -711,23 +687,12 @@ def run_pipeline(force_file: str = None, send_report_email: bool = False, deploy
         else:
             log.info("  Freshness check passed — dashboard reflects current data.")
 
-        # ── Step 4: Send dashboard email (optional — on data change, or once ────
-        # guaranteed at end of day as either the dashboard itself or a short ────
-        # confirmation notice if it already went out earlier today) ────────────
+        # ── Step 4: Send dashboard email (optional — on data change, or ─────────
+        # unconditionally at each hour in GUARANTEED_SEND_HOURS) ────────────────
         if send_report_email:
             action, reason = _should_send_report(data)
             if action is None:
                 log.info("Dashboard email skipped — %s.", reason)
-            elif action == "notice":
-                log.info(DIVIDER)
-                log.info("STEP 4 — End-of-Day Notice (%s)", reason)
-                try:
-                    sent_state = _load_report_sent_state()
-                    sent_at = sent_state.get("time", "earlier today")
-                    send_end_of_day_notice(sent_at)
-                    _mark_notice_sent()
-                except Exception:
-                    log.warning("End-of-day notice failed (non-fatal):\n%s", traceback.format_exc())
             else:
                 log.info(DIVIDER)
                 log.info("STEP 4 — Dashboard Email (%s)", reason)
@@ -737,7 +702,9 @@ def run_pipeline(force_file: str = None, send_report_email: bool = False, deploy
                     ins = compute_insights(d)
                     pdf_bytes = build_pdf(ins)
                     _send(pdf_bytes, None, ins['month'])
-                    _mark_report_sent(data)
+                    now_hour = datetime.now().hour
+                    slot_hour = now_hour if now_hour in GUARANTEED_SEND_HOURS else None
+                    _mark_report_sent(data, slot_hour=slot_hour)
                 except Exception:
                     log.warning("Dashboard email failed (non-fatal):\n%s", traceback.format_exc())
 
